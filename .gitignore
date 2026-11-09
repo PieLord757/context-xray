@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+# Generated reports can contain private content.
+context-xray-report*.md
+reports/
