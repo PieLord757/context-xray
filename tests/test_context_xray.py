@@ -427,6 +427,135 @@ class FirstScreen(unittest.TestCase):
         self.assertEqual(session.turns[0]["hidden"][0][0], "local-command-stdout")
 
 
+BRIEF = "## Job\nFix login.\n\n## Next step\nRun the tests.\n\n## Assumptions\nNone\n\n## Conflicts\nNone\n"
+
+
+class CheckIn(unittest.TestCase):
+    def session(self, used=100000, window=1000000):
+        session = cx.Session("Claude Code", "x.jsonl")
+        session.real_total, session.window, session.window_source, session.cwd = used, window, "catalog", "/repo"
+        return session
+
+    def rich(self):
+        session = self.session()
+        session.add("System prompt", "s", "x" * 3000, cx.EV_REQUEST)
+        session.add("MCP tools", "mcp__idle__a", "x" * 90000, cx.EV_REQUEST)
+        session.add("CLAUDE.md / AGENTS.md", "/h/CLAUDE.md (user)", "rules", cx.EV_REQUEST)
+        session.add("Memory", "/h/MEMORY.md (AutoMem)", "notes", cx.EV_REQUEST)
+        session.add("MCP server instructions", "MCP instructions", "## abc\nGranola is a notepad.", cx.EV_REQUEST)
+        event = turn(prompt="Fix the login bug")
+        event["tokens_end"] = 100000
+        event["steps"] += [
+            {"name": "Read", "summary": "/repo/a.py", "result_tokens": 10, "error": False, "input_tokens": 1, "path": "/repo/a.py", "command": "", "changed": []},
+            {"name": "Edit", "summary": "/repo/a.py", "result_tokens": 10, "error": False, "input_tokens": 1, "path": "/repo/a.py", "command": "", "changed": ["/repo/a.py"]},
+            {"name": "Bash", "summary": "Run tests", "result_tokens": 10, "error": False, "input_tokens": 1, "path": None, "command": "pytest", "changed": []},
+        ]
+        session.turns = [event]
+        session.events = [event]
+        return session
+
+    def text_of(self, session, brief=BRIEF):
+        session.finalize()
+        return cx.build_checkin(session, brief)
+
+    def test_plain_language_rules(self):
+        for text in (self.text_of(self.rich()), self.rich_setup()):
+            for word in ("harness", "deferred", "mcp", "injected", "context map", "compaction", "brief-back"):
+                self.assertIsNone(cx.re.search(r"\b%s\b" % word, text, cx.re.I), word)
+            self.assertNotIn("·", text)
+            self.assertFalse(any(line.lstrip().startswith("|") for line in text.splitlines()))
+
+    def rich_setup(self):
+        session = self.rich()
+        session.finalize()
+        return cx.build_setup(session)
+
+    def test_tokens_appears_once_and_stays_small(self):
+        text = self.text_of(self.rich())
+        self.assertEqual(text.lower().count("tokens"), 1)
+        self.assertLess(len(text), 1800)
+
+    def test_knowledge_map(self):
+        session = self.rich()
+        session.finalize()
+        known = cx.knowledge_map(session)
+        self.assertEqual(known["told"], "1 message")
+        self.assertEqual(known["instructions"], "your `CLAUDE.md`, notes saved from earlier chats")
+        self.assertEqual(known["read"], "`a.py`, 1 command result")
+        self.assertEqual(known["changed"], "`a.py`")
+        self.assertEqual(known["lost"], "nothing")
+
+    def test_commands_that_write_are_disclosed(self):
+        session = self.rich()
+        session.turns[0]["steps"].append({"name": "Bash", "summary": "Write", "result_tokens": 1, "error": False, "input_tokens": 1, "path": None, "command": "cat > a <<EOF", "changed": []})
+        session.finalize()
+        self.assertIn("1 command that may have changed files", cx.knowledge_map(session)["changed"])
+
+    def test_checkin_turn_is_excluded(self):
+        session = self.rich()
+        check = turn(n=2, prompt="/context-xray")
+        check["tokens_end"] = 110000
+        check["steps"].append({"name": "Write", "summary": "/tmp/b", "result_tokens": 1, "error": False, "input_tokens": 1, "path": "/tmp/b", "command": "", "changed": ["/tmp/b"]})
+        session.turns.append(check)
+        session.real_total = 110000
+        session.finalize()
+        self.assertEqual(cx.checkin_total(session), 100000)
+        self.assertEqual(cx.knowledge_map(session)["changed"], "`a.py`")
+        self.assertEqual(cx.last_request(session)[0], "Fix the login bug")
+
+    def test_last_request_skips_approvals(self):
+        session = self.session()
+        session.turns = [turn(prompt="Build the login page"), turn(n=2, prompt="Yes, build it"), turn(n=3, prompt="1. Yes\n2. Your recommendation is good")]
+        self.assertEqual(cx.last_request(session), ("Build the login page", 2))
+
+    def test_brief_items_accepts_any_list_style(self):
+        self.assertEqual(cx.brief_items("1. A\n2. B"), ["A", "B"])
+        self.assertEqual(cx.brief_items("- A"), ["A"])
+        self.assertEqual(cx.brief_items("Plain prose."), ["Plain prose."])
+        self.assertEqual(cx.brief_items("None"), [])
+
+    def test_next_move_priority(self):
+        guess = BRIEF.replace("## Assumptions\nNone", "## Assumptions\n- It thinks tests stay")
+        parsed = cx.parse_brief(guess)
+        self.assertIn("Tell it one thing", cx.next_move(self.session(), parsed)[0])
+        self.assertEqual(cx.next_move(self.session(used=900000), parsed)[1], "reset")
+        self.assertIn("start a new chat soon", cx.next_move(self.session(used=700000), cx.parse_brief(BRIEF))[0])
+        self.assertIn("You can give it the next task.", cx.next_move(self.session(), cx.parse_brief(BRIEF))[0])
+
+    def test_reset_gives_paste_line(self):
+        session = self.rich()
+        session.real_total = session.turns[0]["tokens_end"] = 900000
+        self.assertIn("/compact Keep: Fix login.", self.text_of(session))
+
+    def test_no_task_and_missing_brief(self):
+        self.assertIn("hasn't been given one", self.text_of(self.rich(), "## Job\nNo task yet"))
+        self.assertIn("didn't say back", self.text_of(self.rich(), None))
+        past = self.rich()
+        past.live = False
+        self.assertIn("past chat", self.text_of(past, None))
+
+    def test_show_is_capped(self):
+        session = self.session()
+        session.add("Tool results", "Read", "y" * 9000, cx.EV_REQUEST, cx.CONVO, detail="/repo/big.py")
+        session.finalize()
+        text = cx.build_show(session, "big.py")
+        self.assertLess(len(text), 3300)
+        self.assertIn("first 3,000 of 9,000", text)
+        self.assertIn("Nothing it currently holds", cx.build_show(session, "absent"))
+
+    def test_app_servers_are_not_suggested(self):
+        session = self.session()
+        session.add("MCP tools", "mcp__Claude_Browser__a", "x" * 9000, cx.EV_REQUEST)
+        session.finalize()
+        self.assertEqual(cx.setup_items(session), [])
+
+    def test_report_has_no_duplicate_verbatim(self):
+        session = self.rich()
+        session.add("Your messages", "User message", "UNIQUE-MESSAGE", cx.EV_REQUEST, cx.CONVO)
+        session.finalize()
+        self.assertEqual(cx.build_report(session, BRIEF).count("UNIQUE-MESSAGE"), 1)
+
+
 class EndToEnd(unittest.TestCase):
     def run_cli(self, argv):
         out = io.StringIO()
@@ -442,21 +571,30 @@ class EndToEnd(unittest.TestCase):
                 handle.write("My job is fixing login.")
             report = os.path.join(tmp, "out", "r.md")
             code, summary = self.run_cli(["--agent", "claude", "--log", log, "--out", report, "--self-report", brief])
+            _, full = self.run_cli(["--agent", "claude", "--log", log, "--out", report + ".2", "--self-report", brief, "--full"])
             self.assertEqual(code, 0)
             with open(report) as handle:
                 body = handle.read()
             mode = stat.S_IMODE(os.stat(report).st_mode)
         self.assertEqual(mode, 0o600)
-        self.assertNotIn(FAKE_GITHUB, body)
-        self.assertNotIn(FAKE_GITHUB, summary)
+        self.assertNotIn(FAKE_GITHUB, body + summary + full)
         self.assertIn("[REDACTED:github-token]", body)
-        self.assertIn("self-reported, not verified", summary)
-        self.assertIn("My job is fixing login.", summary)
-        self.assertIn("What is in its head", summary)
-        self.assertIn("Manager's view", summary)
-        self.assertIn("How the messages built this context", summary)
+        self.assertIn("self-reported, not verified", body)
+        self.assertIn("It has read", body)
+        self.assertIn("# Appendix", body)
+        self.assertIn("What it knows", summary)
         self.assertIn(report, summary)
-        self.assertNotIn("{{", summary + body)
+        self.assertIn("Manager's view", full)
+        self.assertNotIn("{{", summary + body + full)
+
+    def test_setup_and_show_are_redacted_and_small(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = write_jsonl(tmp, "s.jsonl", claude_rows())
+            _, setup = self.run_cli(["--agent", "claude", "--log", log, "--setup"])
+            _, show = self.run_cli(["--agent", "claude", "--log", log, "--show", "a.py"])
+        self.assertIn("your setup", setup)
+        self.assertNotIn(FAKE_GITHUB, show)
+        self.assertIn("[REDACTED:github-token]", show)
 
     def test_self_report_only_is_marked_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -172,6 +172,7 @@ class Session(object):
         self.scale = None
         self.partial = False
         self.window_source = None  # "log", "catalog", "inferred" or "flag"
+        self.live = True  # False when reading a past session through --log
         self.standing_gap = 0
         self.first_total = None
         self.skills = collections.OrderedDict()  # name -> estimated tokens
@@ -181,8 +182,9 @@ class Session(object):
         self.coverage = None  # (matched, total) messages against the request log
         self.signals = {}
 
-    def add(self, section, label, text, evidence, group=BEFORE, tokens=None, role=None):
+    def add(self, section, label, text, evidence, group=BEFORE, tokens=None, role=None, detail=None):
         self.blocks.append({
+            "detail": detail,
             "section": section, "label": label, "text": text, "evidence": evidence,
             "group": group, "est": estimate(text) if tokens is None else tokens,
             "tokens": None, "role": role, "basis": "estimate",
@@ -363,6 +365,8 @@ def is_tool_result_line(row):
         isinstance(b, dict) and b.get("type") in ("tool_result", "advisor_tool_result") for b in content)
 
 
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+PATCH_FILE = re.compile(r"\*\*\* (?:Update|Add|Delete) File: ([^\n\"\\]+)")
 LOCAL_COMMAND_TAGS = ("<command-name>", "<local-command-", "<command-message>")
 
 
@@ -534,6 +538,8 @@ def parse_claude(path):
             group = BEFORE
         session.add(section, label, text, evidence, group, role="user")
 
+    tool_details = {}
+
     def classify(message, evidence, tool_names):
         role = message.get("role")
         for block in as_blocks(message.get("content")):
@@ -566,11 +572,12 @@ def parse_claude(path):
                         session.add(section, label.group(1) if label else "Injected text", remainder.strip(), evidence, CONVO, role=role)
             elif kind in ("tool_use", "server_tool_use"):
                 tool_names[block.get("id")] = block.get("name")
+                tool_details[block.get("id")] = tool_summary(block.get("name"), block.get("input"))
                 session.add("Tool calls", block.get("name") or "tool", json.dumps(block.get("input"), ensure_ascii=False, indent=1), evidence, CONVO, role=role)
             elif kind in ("tool_result", "advisor_tool_result", "web_search_tool_result"):
                 text, images = tool_result_text(block)
                 name = tool_names.get(block.get("tool_use_id"), "tool")
-                session.add("Tool results", name, text, evidence, CONVO, tokens=estimate(text) + images * IMAGE_TOKENS, role=role)
+                session.add("Tool results", name, text, evidence, CONVO, tokens=estimate(text) + images * IMAGE_TOKENS, role=role, detail=tool_details.get(block.get("tool_use_id")))
             elif kind == "thinking":
                 visible = block.get("thinking") or ""
                 body = visible or "[thinking text not recorded; only an encrypted signature is in the log]"
@@ -745,6 +752,9 @@ def parse_claude(path):
                 turn["steps"].append(step)
                 tool_lookup[block.get("id")] = step
                 tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                step["path"] = tool_input.get("file_path") or tool_input.get("notebook_path")
+                step["command"] = tool_input.get("command") if isinstance(tool_input.get("command"), str) else ""
+                step["changed"] = [step["path"]] if step["path"] and block.get("name") in EDIT_TOOLS else []
                 if block.get("name") == "Read" and tool_input.get("file_path"):
                     read_counts[tool_input["file_path"]] += 1
         usage = message.get("usage")
@@ -899,6 +909,8 @@ def parse_codex(path):
                 except ValueError:
                     parsed = raw
                 step = {"name": payload.get("name"), "summary": tool_summary(payload.get("name"), parsed), "result_tokens": None, "error": False, "input_tokens": estimate(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False))}
+                raw_text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                step["path"], step["command"], step["changed"] = None, raw_text, PATCH_FILE.findall(raw_text or "")
                 tool_lookup[payload.get("call_id")] = step
                 if turn is not None:
                     turn["steps"].append(step)
@@ -912,7 +924,7 @@ def parse_codex(path):
 
     if not any(b["section"] == "System prompt" for b in session.blocks):
         session.add("System prompt", "Not in this log", "(not recorded)", EV_NONE, BEFORE, tokens=0)
-    calls = {}
+    calls, details = {}, {}
     first_prompt_seen = False
     for item in context:
         item_type = item.get("type")
@@ -944,10 +956,11 @@ def parse_codex(path):
         elif item_type in ("function_call", "custom_tool_call"):
             raw = item.get("arguments") if item_type == "function_call" else item.get("input")
             calls[item.get("call_id")] = item.get("name")
+            details[item.get("call_id")] = one_line(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False), 90)
             session.add("Tool calls", item.get("name") or "tool", raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False), EV_SESSION, CONVO, role="assistant")
         elif item_type in ("function_call_output", "custom_tool_call_output"):
             text, images = codex_output_text(item.get("output"))
-            session.add("Tool results", calls.get(item.get("call_id"), "tool"), text, EV_SESSION, CONVO, tokens=estimate(text) + images * IMAGE_TOKENS, role="tool")
+            session.add("Tool results", calls.get(item.get("call_id"), "tool"), text, EV_SESSION, CONVO, tokens=estimate(text) + images * IMAGE_TOKENS, role="tool", detail=details.get(item.get("call_id")))
         elif item_type == "reasoning":
             session.add("Thinking", "Reasoning", "[encrypted by the provider; not recoverable]", EV_SESSION, CONVO, tokens=int(len(item.get("encrypted_content") or "") / 8), role="assistant")
     session.add("Built-in tools", "Built-in tool schemas", "(Codex logs only hashes of its built-in tools, not their text)", EV_NONE, BEFORE, tokens=0)
@@ -1262,7 +1275,7 @@ def brief_comparison(session, brief):
     if len(asks) > len(shown):
         left = "*(%d earlier messages omitted)*<br>%s" % (len(asks) - len(shown), left)
     lines = ["| What you asked (from the log) | What it says its job is (self-reported) |", "|---|---|", "| %s | %s |" % (left, cell(one_line(job, 400)))]
-    count = lambda name: len(re.findall(r"(?m)^\s*[-*]\s", brief_section(brief, name)))
+    count = lambda name: len(brief_items(brief_section(brief, name)))
     lines += ["", "It lists %d assumption(s) and %d conflict(s) in the full brief-back below." % (count("Unclear or assumed"), count("Conflicts"))]
     return "\n".join(lines)
 
@@ -1583,19 +1596,25 @@ def turn_detail(event):
 
 
 def build_report(session, self_report, redactions_placeholder="{{REDACTIONS}}"):
-    parts = ["# Context X-ray report", ""] + first_screen(session, self_report)
-    parts += ["- **Working directory:** `%s`" % (session.cwd or "unknown"),
+    parts = ["# Context X-ray report", ""] + checkin_lines(session, self_report)
+    parts += ["- **Agent:** %s %s" % (session.agent, session.version or ""),
+              "- **Model:** %s" % (session.model or "unknown"),
+              "- **Session:** `%s`" % session.session_id,
+              "- **Working directory:** `%s`" % (session.cwd or "unknown"),
               "- **Log file:** `%s`" % session.path,
               "- **Generated:** %s" % dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
               "- **Secrets redacted:** %s" % redactions_placeholder, "",
               "> This report can contain private content such as instruction files and tool output. Pattern-based redaction misses things, so review before sharing.", ""]
-    parts += ["## All suggestions", "", worth_doing_text(session), "",
+    if self_report:
+        parts += ["## What it said back (self-reported, not verified)", "", "The agent wrote this before seeing any of this report.", "", self_report.strip(), ""]
+    story, story_ids = story_parts(session)
+    parts += story
+    parts += ["# Appendix", "", "## Size figures include this check-in", "", "The gauge at the top is measured from before this check-in began. The tables below use the last logged request.", "",
+              "## All suggestions", "", worth_doing_text(session), "",
               "## How the messages built this context", "", timeline_table(session), "",
               "## Full context map", "", map_table(session), ""]
     parts += breakdown_parts(session, detail=True)
     parts += ["## Manager's view", "", "These are mechanical facts from the log, not a score.", "", manager_view(session, limit=15), ""]
-    if self_report:
-        parts += ["## Brief-back (self-reported, not verified)", "", "The agent wrote this before seeing the rest of this report.", "", self_report.strip(), ""]
     parts += how_sure(session)
     parts += ["### What the labels mean", "",
               "- **request log:** text recorded as part of the API request the agent sent.",
@@ -1604,15 +1623,421 @@ def build_report(session, self_report, redactions_placeholder="{{REDACTIONS}}"):
               "- **not recorded:** the log does not contain it.", "",
               "## Turn by turn", ""]
     parts += [turn_detail(event) for event in session.events]
-    parts += ["## Verbatim: before your first message", ""]
+    parts += ["## Verbatim: everything else it loaded", ""]
     grouped = section_rows(session)
     for name, members in grouped.items():
-        standing = [m for m in members if m["group"] == BEFORE]
+        standing = [m for m in members if m["group"] == BEFORE and id(m) not in story_ids]
         if standing:
             parts += ["### %s" % name, ""] + [verbatim(m) for m in standing]
-    parts += ["## Verbatim: the conversation still in context", "", "In the order the agent sees it.", ""]
-    parts += ["**%s** (%s)\n\n%s" % (b["section"], b["role"] or "?", verbatim(b)) for b in session.blocks if b["group"] == CONVO]
+    parts += ["## Verbatim: the rest of the conversation", ""]
+    parts += ["**%s** (%s)\n\n%s" % (b["section"], b["role"] or "?", verbatim(b)) for b in session.blocks if b["group"] == CONVO and id(b) not in story_ids]
     return "\n".join(parts) + "\n"
+
+
+# ------------------------------------------------------------- the check-in
+
+ACK_LINE = re.compile(r"^(\d+[.)]\s*)?(yes|yep|yeah|ok|okay|sure|no|nope|continue|go ahead|do it|sounds good|thanks|thank you|agreed|great|perfect|looks good|please do|your recommendation)\b", re.I)
+APP_SERVERS = ("ccd_", "Claude_")
+INTERNAL_TOOLS = ("TodoWrite", "ToolSearch", "Skill", "AskUserQuestion", "advisor", "ExitPlanMode", "EnterPlanMode")
+WRITE_COMMAND = re.compile(r"(>|\bsed -i|\bmv\b|\bcp\b|\brm\b|\bmkdir\b|\btouch\b|\btee\b|\bgit (commit|apply|checkout|switch|merge)|<<|\bnpm (install|i)\b|\bpip install\b)")
+SELF_RUN = "context_xray.py"
+
+
+def is_acknowledgement(text):
+    """Short replies such as 'Yes, build it' say nothing about what the job is."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return bool(lines) and all(ACK_LINE.match(line) for line in lines) and all(len(line) < 90 for line in lines[:1] if len(lines) == 1)
+
+
+def is_checkin_turn(turn):
+    if turn["prompt"].lstrip().startswith("/context-xray"):
+        return True
+    for step in turn["steps"]:
+        if step["name"] == "Skill" and "context-xray" in (step["summary"] or ""):
+            return True
+        if SELF_RUN in (step.get("command") or ""):
+            return True
+    return False
+
+
+def work_turns(session):
+    """Turns before this check-in, so the report does not describe itself."""
+    turns = session.turns
+    for index in range(len(turns) - 1, -1, -1):
+        if is_checkin_turn(turns[index]):
+            return turns[:index]
+    return turns
+
+
+def checkin_total(session):
+    """Context size as it was before this check-in began."""
+    work = work_turns(session)
+    if len(work) == len(session.turns):
+        return session.real_total
+    ended = [t["tokens_end"] for t in work if t["tokens_end"] is not None]
+    if ended:
+        return ended[-1]
+    return session.first_total or session.real_total
+
+
+def plural(count, word):
+    return "%d %s%s" % (count, word, "" if count == 1 else "s")
+
+
+def brief_items(text):
+    """Read a brief-back section as a list, whether it is bullets, numbers or prose."""
+    if not text.strip():
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if any(re.match(r"([-*]|\d+[.)])\s", line) for line in lines):
+        items = [re.sub(r"^([-*]|\d+[.)])\s+", "", line) for line in lines if re.match(r"([-*]|\d+[.)])\s", line)]
+    else:
+        items = [" ".join(lines)]
+    return [i for i in items if not re.match(r"^(none|n/?a|nothing)\b", i, re.I)]
+
+
+def parse_brief(brief):
+    if not brief or not brief.strip():
+        return None
+    job = brief_section(brief, "Job") or brief_section(brief, "Current job")
+    if not job:
+        first = next((line.strip() for line in brief.splitlines() if line.strip() and not line.lstrip().startswith("#")), "")
+        job = first
+    return {
+        "job": one_line(job, 150),
+        "plan": one_line(brief_section(brief, "Next step"), 150),
+        "assumptions": brief_items(brief_section(brief, "Assumptions") or brief_section(brief, "Unclear or assumed")),
+        "conflicts": brief_items(brief_section(brief, "Conflicts")),
+    }
+
+
+def no_task(parsed):
+    return bool(parsed) and re.match(r"^no task", parsed["job"], re.I) is not None
+
+
+def memory_share(session):
+    total = checkin_total(session)
+    return float(total) / session.window if total and session.window else None
+
+
+def checkin_gauge(session):
+    total = checkin_total(session)
+    if total is None:
+        return "**The log has no size numbers for this chat.**"
+    if not session.window:
+        return "**The agent is holding %s tokens.** I can't tell how much room it has left." % fmt(total)
+    filled = min(24, int(round(24.0 * total / session.window)))
+    bar = "`%s%s`" % ("█" * filled, "░" * (24 - filled))
+    percent = 100.0 * total / session.window
+    if total > session.window:
+        return "%s **The agent's memory is over its listed limit** (%s of %s tokens)" % (bar, fmt(total), fmt(session.window))
+    return "%s **The agent's memory is %.1f%% full** (%s of %s tokens)" % (bar, percent, fmt(total), fmt(session.window))
+
+
+def next_move(session, parsed):
+    """Return the headline. Priority: start fresh, then fix its picture, then carry on."""
+    share = memory_share(session)
+    compactions = sum(1 for e in session.events if e["event"] == "compaction")
+    lost = sum(1 for t in session.turns if not t["in_context"] and t["kind"] == "you")
+    if (share is not None and share >= 0.85) or compactions >= 2:
+        reasons = []
+        if share is not None and share >= 0.85:
+            reasons.append("It's %d%% full" % round(100 * share))
+        if lost:
+            reasons.append("has forgotten %s" % plural(lost, "of your earlier message").replace("message", "messages", 1) if lost != 1 else "has forgotten 1 of your earlier messages")
+        reason = " and ".join(reasons) or "It has been through several rounds of forgetting"
+        reason = reason[0].upper() + reason[1:]
+        return "**Start a new chat, or run `/compact`.** %s." % reason, "reset"
+    if parsed and not no_task(parsed):
+        concerns = parsed["conflicts"] + parsed["assumptions"]
+        if concerns:
+            first = one_line(concerns[0], 170).rstrip(".")
+            if len(concerns) == 1:
+                return "**Tell it one thing before it continues.** %s. If that's wrong, say so now." % first, "correct"
+            return "**Check %d things before it continues.** %s. Also: %s. If either is wrong, say so now." % (min(len(concerns), 2), first, one_line(concerns[1], 170).rstrip(".")), "correct"
+    if parsed is None and not session.live:
+        return "**This is a past chat, so it can't say what it was thinking.** Below is what the log shows it knew.", "past"
+    if parsed is None:
+        return "**It didn't say back its job, so check its work before giving it more.**", "unknown"
+    if no_task(parsed):
+        return "**You can give it the next task.** It hasn't been given one yet and has plenty of room.", "continue"
+    if share is not None and share >= 0.6:
+        return "**You can give it the next task, but start a new chat soon.** It's %d%% full." % round(100 * share), "continue"
+    if compactions:
+        return "**You can give it the next task, but check what it forgot.** %s can't be read in full anymore." % plural(lost, "earlier message"), "continue"
+    return "**You can give it the next task.** It has the right picture of the job and plenty of room left.", "continue"
+
+
+def display_path(session, path):
+    if session.cwd and path.startswith(session.cwd.rstrip("/") + "/"):
+        return path[len(session.cwd.rstrip("/")) + 1:]
+    return os.path.basename(path)
+
+
+def format_items(items, limit=8):
+    """At most `limit` names, grouped by folder when that fits, always saying what was left out."""
+    if len(items) <= limit:
+        return ["`%s`" % i for i in items]
+    folders = collections.OrderedDict()
+    for item in items:
+        folders[os.path.dirname(item) or "."] = folders.get(os.path.dirname(item) or ".", 0) + 1
+    if 1 < len(folders) <= limit or (len(folders) == 1 and "." not in folders):
+        return ["`%s/` (%s)" % (folder, plural(count, "file")) if folder != "." else plural(count, "other file") for folder, count in folders.items()]
+    return ["`%s`" % i for i in items[:limit]] + ["+%d more" % (len(items) - limit)]
+
+
+def knowledge_map(session):
+    work = work_turns(session)
+    current = [t for t in work if t["in_context"]]
+    reads, changed, commands, maybe_changed, web, other, skills = [], [], [], 0, 0, 0, []
+    steps = [step for turn in reversed(current) for step in reversed(turn["steps"])]
+    for step in steps:
+        name = step["name"] or ""
+        command = step.get("command") or ""
+        for path in step.get("changed") or []:
+            shown = display_path(session, path)
+            if shown not in changed:
+                changed.append(shown)
+        if name == "Skill":
+            skills.append(one_line(step["summary"], 40))
+        elif name == "Read" and step.get("path"):
+            shown = display_path(session, step["path"])
+            if shown not in reads:
+                reads.append(shown)
+        elif name in ("WebFetch", "WebSearch"):
+            web += 1
+        elif name == "Bash" or "shell" in name.lower() or "exec" in name.lower() and not step.get("changed"):
+            commands.append(one_line(step["summary"] or command, 40))
+            maybe_changed += 1 if WRITE_COMMAND.search(command) else 0
+        elif not (name in EDIT_TOOLS or name in INTERNAL_TOOLS or name.startswith("mcp__ccd_") or step.get("changed")):
+            other += 1
+    for block in session.blocks:
+        if block["section"] == "Files attached" and block["label"].startswith(("File attachment", "@ mention")) and ": " in block["label"]:
+            shown = display_path(session, block["label"].split(": ", 1)[1])
+            if shown not in reads:
+                reads.append(shown)
+
+    told = [t for t in current if t["kind"] == "you"]
+    instructions = []
+    for block in session.blocks:
+        if block["section"] == "CLAUDE.md / AGENTS.md":
+            name = "AGENTS.md" if "AGENTS" in block["label"] else "CLAUDE.md"
+            owner = "the project's" if "(project)" in block["label"] else "your"
+            entry = "%s `%s`" % (owner, name)
+            if entry not in instructions:
+                instructions.append(entry)
+        elif block["section"] == "Memory" and "notes saved from earlier chats" not in instructions:
+            instructions.append("notes saved from earlier chats")
+    unique_skills = list(dict.fromkeys(skills))
+    instructions += ["the `%s` skill" % s for s in unique_skills[:3]]
+    if len(unique_skills) > 3:
+        instructions.append("%d more skills" % (len(unique_skills) - 3))
+
+    read_parts = format_items(reads)
+    if commands:
+        if session.agent == "Codex":
+            read_parts.append("%s (latest: %s)" % (plural(len(commands), "command"), ", ".join("`%s`" % c for c in commands[:3])))
+        else:
+            read_parts.append(plural(len(commands), "command result"))
+    if web:
+        read_parts.append(plural(web, "web page"))
+    if other:
+        read_parts.append(plural(other, "result") + " from other tools")
+    changed_parts = format_items(changed)
+    if maybe_changed:
+        changed_parts.append(plural(maybe_changed, "command") + " that may have changed files")
+
+    lost = [t for t in session.turns if not t["in_context"] and t["kind"] == "you"]
+    return {
+        "told": plural(len(told), "message") if told else "nothing yet",
+        "instructions": ", ".join(instructions) or "none",
+        "read": ", ".join(read_parts) or "nothing yet",
+        "changed": ", ".join(changed_parts) or "nothing yet",
+        "lost": "%s (only a summary remains)" % plural(len(lost), "of your earlier message").replace("message", "messages", 1) if len(lost) > 1 else ("1 of your earlier messages (only a summary remains)" if lost else "nothing"),
+    }
+
+
+def last_request(session):
+    """The most recent message that actually asks for something."""
+    asks = [t for t in work_turns(session) if t["kind"] == "you"]
+    later = 0
+    for turn in reversed(asks):
+        if not is_acknowledgement(turn["prompt"]):
+            return one_line(turn["prompt"], 130), later
+        later += 1
+    return (one_line(asks[-1]["prompt"], 130), 0) if asks else ("", 0)
+
+
+def why_full(session):
+    total = sum(b["tokens"] for b in session.blocks) or 1
+    setup = sum(b["tokens"] for b in session.blocks if b["section"] in PLAIN_GROUPS[0][1])
+    share = int(round(100.0 * setup / total))
+    if share >= 90:
+        return "**Why it's that full:** Almost all of it (%d%%) is built-in instructions and tools that load before you type anything. Only %d%% is from this chat." % (share, 100 - share)
+    if share >= 50:
+        return "**Why it's that full:** Most of it (%d%%) is built-in instructions and tools that load before you type anything. The other %d%% is from this chat." % (share, 100 - share)
+    return "**Why it's that full:** Most of it (%d%%) is from this chat. The other %d%% is built-in instructions and tools that load before you type anything." % (100 - share, share)
+
+
+def server_names(session):
+    """Turn opaque server ids into names, using the first words of their instructions."""
+    names = {}
+    for block in session.blocks:
+        if block["section"] == "MCP server instructions":
+            for server, line in re.findall(r"(?m)^## (\S+)\n+(.+)", block["text"]):
+                match = re.match(r"(?:(?:The|An?|Official|official)\s+)*([A-Z][\w-]*(?:\s+[A-Z][\w-]*)*)", line)
+                if match and not match.group(1).startswith("Use"):
+                    names[server] = re.sub(r"\s+(MCP|Server|Proxy)\b.*$", "", match.group(1))
+    return names
+
+
+def setup_items(session):
+    """Removable tools and plugins nobody used in this chat, biggest first."""
+    if session.agent != "Claude Code":
+        return []
+    used = {step["name"] for turn in session.turns for step in turn["steps"]}
+    named = server_names(session)
+    servers = collections.OrderedDict()
+    for block in session.blocks:
+        if block["section"] == "MCP tools" and block["evidence"] != EV_NONE:
+            servers.setdefault(tool_server(block["label"])[0], []).append(block)
+    items = []
+    for server, members in servers.items():
+        tokens = sum(m["tokens"] for m in members)
+        if tokens >= 500 and not server.startswith(APP_SERVERS) and not any(m["label"] in used for m in members):
+            items.append((tokens, named.get(server, server), plural(len(members), "tool")))
+    used_skills = {step["summary"] for turn in session.turns for step in turn["steps"] if step["name"] == "Skill"}
+    sources = collections.OrderedDict()
+    for name, tokens in session.skills.items():
+        sources.setdefault(skill_source(name), []).append((name, tokens))
+    for source, members in sources.items():
+        tokens = sum(m[1] for m in members)
+        if tokens >= 500 and source != "user or built-in" and not any(m[0] in used_skills for m in members):
+            items.append((tokens, source, plural(len(members), "skill")))
+    return sorted(items, key=lambda item: -item[0])
+
+
+def setup_pointer(session):
+    used = checkin_total(session) or 0
+    spare = sum(item[0] for item in setup_items(session))
+    if used and spare >= max(0.10 * used, 5000):
+        return "**You could free up space:** about %d%% of this is tools you aren't using. Run `/context-xray setup` to see which." % round(100.0 * spare / used)
+    return ""
+
+
+def incomplete_note(session):
+    if session.agent != "Claude Code":
+        return ""
+    if not session.coverage:
+        return "**Heads up:** this version of Claude Code doesn't record everything it loads, so some of this is missing. Updating it should fix that."
+    matched, count = session.coverage
+    if count and float(matched) / count < 0.9:
+        return "**Heads up:** %d of %d messages couldn't be recovered from the log, so some of this is missing." % (count - matched, count)
+    return ""
+
+
+def checkin_lines(session, brief):
+    parsed = parse_brief(brief)
+    headline, move = next_move(session, parsed)
+    lines = [checkin_gauge(session), "", headline, ""]
+    if move == "reset":
+        keep = (parsed["job"] if parsed else last_request(session)[0]).replace("`", "")
+        lines += ["**Paste this:** `/compact Keep: %s`" % one_line(keep, 110), ""]
+    if parsed and not no_task(parsed):
+        asked, later = last_request(session)
+        lines += ["**What it thinks it's doing**"]
+        if asked:
+            lines.append("- **You asked:** %s%s" % (asked, " (plus %s)" % plural(later, "later reply").replace("replys", "replies") if later else ""))
+        lines.append("- **It thinks its job is:** %s" % parsed["job"])
+        if parsed["plan"]:
+            lines.append("- **It plans to:** %s" % parsed["plan"])
+        lines.append("")
+    known = knowledge_map(session)
+    lines += ["**What it knows**",
+              "- **You told it:** %s" % known["told"],
+              "- **Instructions it loaded:** %s" % known["instructions"],
+              "- **It has read:** %s" % known["read"],
+              "- **It has changed:** %s" % known["changed"],
+              "- **It has forgotten:** %s" % known["lost"], "",
+              why_full(session), ""]
+    for extra in (setup_pointer(session), incomplete_note(session)):
+        if extra:
+            lines += [extra, ""]
+    return lines
+
+
+def build_checkin(session, brief):
+    lines = ["**Context X-ray**", ""] + checkin_lines(session, brief)
+    lines += ["Ask me to show anything it read, or open the [full report]({{REPORT}})."]
+    return "\n".join(lines) + "\n"
+
+
+def memory_cost(session, tokens):
+    if session.window:
+        return "%.1f%% of its memory" % (100.0 * tokens / session.window)
+    return "about %s" % short_tokens(tokens)
+
+
+def build_setup(session):
+    items = setup_items(session)
+    lines = ["**Context X-ray: your setup**", ""]
+    if items:
+        lines += ["**Loaded in this chat but never used**"]
+        lines += ["- **%s** (%s): %s" % (name, what, memory_cost(session, tokens)) for tokens, name, what in items[:10]]
+        if len(items) > 10:
+            lines.append("- +%d more" % (len(items) - 10))
+        lines += ["", "Turn these off for chats that don't need them.", ""]
+    else:
+        lines += ["Nothing removable stands out in this chat.", ""]
+    built_in = sum(b["tokens"] for b in session.blocks if b["section"] == "Built-in tools")
+    if built_in:
+        lines += ["Built-in tools take up %s. They come with the agent and usually can't be removed." % memory_cost(session, built_in), ""]
+    for block in session.blocks:
+        if block["section"] in ("CLAUDE.md / AGENTS.md", "Memory") and block["tokens"] >= 2000:
+            lines += ["`%s` takes up %s and loads in every chat, so trim anything you don't need every time." % (os.path.basename(block["label"].split(" (")[0]), memory_cost(session, block["tokens"])), ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+SHOW_LIMIT = 3000
+SHOW_SECTIONS = ("Tool results", "Files attached", "CLAUDE.md / AGENTS.md", "Memory", "Your messages", "Skills loaded", "Compaction summary", "Assistant text")
+
+
+def build_show(session, query):
+    """Print one item's exact text, capped, so a follow-up never loads the whole report."""
+    wanted = query.lower()
+    candidates = [b for b in reversed(session.blocks) if b["section"] in SHOW_SECTIONS]
+    by_name = [b for b in candidates if wanted in (b["label"] + " " + (b.get("detail") or "")).lower()]
+    matches = (by_name or [b for b in candidates if wanted in b["text"].lower()])[:2]
+    if not matches:
+        return "Nothing it currently holds matches \"%s\". It may have been forgotten, so check the full report.\n" % query
+    parts = []
+    for block in matches:
+        text = block["text"]
+        shown = text[:SHOW_LIMIT]
+        tick = fence(shown)
+        parts.append("**%s**\n\n%stext\n%s\n%s" % (one_line(block.get("detail") or block["label"], 90), tick, shown, tick))
+        if len(text) > SHOW_LIMIT:
+            parts.append("Showing the first %s of %s characters. The rest is in the full report." % (fmt(SHOW_LIMIT), fmt(len(text))))
+    return "\n\n".join(parts) + "\n"
+
+
+def story_parts(session):
+    """The report's main body: the same order as the check-in, with exact text."""
+    told = [b for b in session.blocks if b["section"] == "Your messages"]
+    instructions = [b for b in session.blocks if b["section"] in ("CLAUDE.md / AGENTS.md", "Memory", "Skills loaded")]
+    read = [b for b in session.blocks if b["section"] in ("Tool results", "Files attached")]
+    changed = [b for b in session.blocks if b["section"] == "Tool calls" and b["label"] in EDIT_TOOLS]
+    summaries = [b for b in session.blocks if b["section"] == "Compaction summary"]
+    parts = []
+    for title, members in (("You told it", told), ("Instructions it loaded", instructions), ("It has read", read), ("It has changed", changed)):
+        parts += ["## %s" % title, ""]
+        parts += [verbatim(dict(m, label=m.get("detail") or m["label"])) for m in members] or ["Nothing.", ""]
+    parts += ["## It has forgotten", ""]
+    lost = [t for t in session.turns if not t["in_context"]]
+    parts += ["- %s" % one_line(t["prompt"], 200) for t in lost] + ([""] if lost else ["Nothing.", ""])
+    parts += [verbatim(m) for m in summaries]
+    story = {id(m) for group in (told, instructions, read, changed, summaries) for m in group}
+    return parts, story
 
 
 def default_out(session_id):
@@ -1676,6 +2101,9 @@ def main(argv=None):
     parser.add_argument("--out", help="Report path (default: ~/.context-xray/reports/)")
     parser.add_argument("--self-report", help="File with the agent's brief-back, included and labeled unverified")
     parser.add_argument("--self-report-only", help="No log available: save this file as an unverified report")
+    parser.add_argument("--setup", action="store_true", help="Show what installed tools and plugins cost")
+    parser.add_argument("--show", help="Print the exact text of one item the agent holds")
+    parser.add_argument("--full", action="store_true", help="Print the long detailed summary instead of the check-in")
     parser.add_argument("--window", type=int, help="Context window size in tokens, if the log does not state it")
     parser.add_argument("--no-redact", action="store_true", help="Turn off secret redaction")
     args = parser.parse_args(argv)
@@ -1689,10 +2117,19 @@ def main(argv=None):
     session = parse_claude(path) if agent == "claude" else parse_codex(path)
     if args.window:
         session.window, session.window_source = args.window, "flag"
+    session.live = not args.log
+    if args.setup or args.show:
+        text = build_setup(session) if args.setup else build_show(session, args.show)
+        text = strip_base64(text)
+        sys.stdout.write(text if args.no_redact else redact(text)[0])
+        return 0
     brief = read_self_report(args.self_report)
     report = build_report(session, brief)
-    summary = build_summary(session, brief, "{{REPORT}}", collections.Counter())
-    summary = re.sub(r"Secrets redacted: .*?\. Reports", "Secrets redacted: {{REDACTIONS}}. Reports", summary)
+    if args.full:
+        summary = build_summary(session, brief, "{{REPORT}}", collections.Counter())
+        summary = re.sub(r"Secrets redacted: .*?\. Reports", "Secrets redacted: {{REDACTIONS}}. Reports", summary)
+    else:
+        summary = build_checkin(session, brief)
     return finish(report, summary, args, session.session_id)
 
 

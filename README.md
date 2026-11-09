@@ -2,15 +2,39 @@
 
 See exactly what your coding agent has in its head.
 
-Working with a coding agent is managing. A good manager avoids handing an employee a pile of unrelated, contradictory information, yet most of us have no idea what our agent is holding: which instruction files loaded, what was slipped in beside each message, what got compacted away. `context-xray` shows you.
+Working with a coding agent is managing. A good manager avoids handing an employee a pile of unrelated, contradictory information, yet most of us have no idea what our agent is holding. `context-xray` is a check-in: before you hand your agent its next task, it shows what the agent knows and whether it has the right picture of the job.
 
-Run the `context-xray` skill (`/context-xray` in Claude Code, or just ask "what's in your context?") and you get:
+Run `/context-xray` and you get one easy screen. This example is illustrative:
 
-- **A first screen that answers the question**: used, available and percent of the window, a keep-going or compact verdict, and a plain breakdown of what the agent is holding.
-- **Ranked suggestions**: loaded tools and plugins that were never used, repeated injections, re-read files and oversized outputs, each with the tokens involved.
-- **A job check**: what you actually asked beside what the agent says its job is, written before it sees the report.
-- **A Q&A timeline**: each message, tokens added, the running total, and the single biggest thing that turn added. Compaction appears as its own event.
-- **The full detail**: every section with its evidence label, tools by server, skills by source, a manager's view of repeats and forgotten turns, and a local Markdown report with the verbatim text of everything still in context.
+> **Context X-ray**
+>
+> `███░░░░░░░░░░░░░░░░░░░░░` **The agent's memory is 10.6% full** (106,361 of 1,000,000 tokens)
+>
+> **Tell it one thing before it continues.** It thinks the tests should stay unchanged. If that's wrong, say so now.
+>
+> **What it thinks it's doing**
+> - **You asked:** Fix the login bug
+> - **It thinks its job is:** Fix session expiry in `auth.py`
+> - **It plans to:** Add a refresh check, then run the auth tests
+>
+> **What it knows**
+> - **You told it:** 3 messages
+> - **Instructions it loaded:** your `CLAUDE.md`, plus notes saved from earlier chats
+> - **It has read:** `auth.py`, `session.py`, 4 command results, 1 web page
+> - **It has changed:** `auth.py`
+> - **It has forgotten:** nothing
+>
+> **Why it's that full:** Almost all of it (97%) is built-in instructions and tools that load before you type anything. Only 3% is from this chat.
+>
+> Ask me to show anything it read, or open the full report.
+
+The agent says back its job, plan and assumptions before it sees any evidence, so you can catch a wrong plan before work happens.
+
+- **Ask for anything in plain words**, such as "show me what it read from `auth.py`". You get that item's exact text and nothing else.
+- **Run `/context-xray setup`** to see which installed tools and plugins are taking up room without being used.
+- **Open the local report** for every item's exact text, plus token tables, tools by server and a turn-by-turn timeline.
+
+A check-in is built to stay small, because reporting on context shouldn't fill it up.
 
 ## How it compares to `/context`
 
@@ -21,9 +45,9 @@ Claude Code's `/context` is a good size gauge. It tells you how full the window 
 | Token totals by category | Yes | Yes, and it splits "Messages" into your words, hidden injections, thinking, tool calls and tool results |
 | Used, available and % of window | Yes | Yes, overall, per section and per turn |
 | Autocompact buffer | Yes | No, the log doesn't record it. It shows when compaction actually fired |
-| Tokens per tool and server | Yes | Yes |
+| Tokens per tool and server | Yes | Yes, in the report and `setup` |
 | Size of deferred tool schemas | Yes | No, the log has only their names. It does count what listing those names costs |
-| Tokens per skill | Yes | Yes |
+| Tokens per skill | Yes | Yes, in the report |
 | The verbatim text of every section | No | Yes |
 | What was injected with each message | No | Yes |
 | Tokens added by each message, and the biggest cause | No | Yes |
@@ -83,7 +107,7 @@ Redaction is pattern-based and will miss things. Reports contain your instructio
 - The report is a snapshot of the last logged request, so the turn that runs it is not included.
 - Window size comes from the Codex log or Claude Code's cached model catalog. It is the listed limit for the model, and `--window` overrides it.
 - Running the skill adds its own output to the session's context.
-- The verdict is a rule of thumb: compact soon at 60% of the window, compact or start fresh at 85%.
+- The recommendation is a rule of thumb: start a new chat soon at 60% full, start fresh or compact at 85%, and check anything the agent says it is guessing.
 - "Never used" means in this session's main thread, so a tool may still matter elsewhere.
 - Subagents have separate contexts and are excluded.
 - Thinking text is usually encrypted or omitted from logs. Recent Claude Code versions still record its token count; on older logs the size is a low-confidence estimate.
